@@ -6,6 +6,9 @@ from src.services.llm_service import LLMService
 from src.services.redis_client import RedisClient
 from src.core.dialog_state_tracker import StateTracker
 from src.core.intent_router import IntentRouter
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from src.services.rag_service import RAGService # 导入新服务RAG预留
 
 logger = logging.getLogger("BotLogger")
 
@@ -19,6 +22,16 @@ class DebtBotEngine:
         self.llm = LLMService(settings)  # LLM 客户端
         self.redis = RedisClient(settings["redis"])
         self.intent_router = IntentRouter(self.llm, flow_config, settings)
+        self.llm = LLMService(settings)
+        self.rag_service = RAGService() # 初始化 RAG 服务
+        
+        # 预编译话术生成的 Prompt 模板
+        # 我们可以把 flow_choice.yaml 里的字符串转为 LangChain 模板对象
+        self.prompt_templates = {}
+        for key, tmpl_str in prompts_config['stage_flow'].items():
+            # 自动追加 RAG 上下文插槽（如果模板里没写的话
+            final_tmpl_str = tmpl_str + "\n\n{rag_context}" 
+            self.prompt_templates[key] = ChatPromptTemplate.from_template(final_tmpl_str)
 
     async def init_session(self, session_id, customer_data):
         # 初始化 StateTracker + 存 Redis
@@ -124,20 +137,49 @@ class DebtBotEngine:
             "stage": current_stage
         })
         
-        # 5. 生成 prompt 并调用 LLM 生成回复
-        prompt = self.render_prompt(next_stage, customer_data, state_tracker)
+        # 5. [新增] RAG 检索：获取业务知识库上下文
+        # 即使目前 RAGService 是空的，保留这个接口让架构完整
+        rag_context = self.rag_service.retrieve_context(user_input, customer_data)
+
+        # 6. [修改] 准备 LangChain 链的输入变量
+        # 将 客户数据 + RAG上下文 统一打包
+        chain_inputs = {
+            'company': customer_data.get('company', 'XX金融'),
+            'operator': customer_data.get('operator', '客服'),
+            'user_name': customer_data.get('debtor_name', '先生/女士'),
+            'debt_amount': customer_data.get('remaining_amount', 0),
+            'overdue_days': customer_data.get('overdue_days', 0),
+            'rag_context': rag_context,  # 注入 RAG 内容
+            # 如果你的 prompt 里用了 {user_input}，也可以放进去
+            # 'user_input': user_input 
+        }
+
+        # 7. [修改] 获取模板并构建执行链
+        stage_config = self.flow.get(next_stage, {})
+        prompt_key = stage_config.get('prompt_key')
         
-        # 6. 流式生成回复
-        try:
-            # 由于 generate_response 是同步生成器，我们直接迭代
-            # 但需要在每次 yield 后让出控制权
-            for token in self.llm.generate_response(prompt):
-                yield token
-                await asyncio.sleep(0)  # 让出控制权，允许其他协程运行
+        # 从预编译好的模板中获取
+        prompt_template = self.prompt_templates.get(prompt_key)
+
+        if prompt_template:
+            try:
+                # 核心：动态构建 LCEL 链
+                # Chain = Template(填充变量) | LLM(生成) | Parser(转字符串)
+                gen_chain = prompt_template | self.llm.get_llm() | StrOutputParser()
                 
-        except Exception as e:
-            logger.error(f"❌ [Session {session_id}] LLM 生成回复失败: {e}")
-            yield "抱歉，我暂时无法理解，请重新说明一下。"
+                # 8. [修改] 流式调用 (astream)
+                # LangChain 的 astream 会自动处理流式返回
+                async for token in gen_chain.astream(chain_inputs):
+                    yield token
+                    # 在高并发下，适当让出 CPU 时间片
+                    await asyncio.sleep(0)
+
+            except Exception as e:
+                logger.error(f"❌ [Session {session_id}] Chain执行失败: {e}")
+                yield "抱歉，请您再说一遍。"
+        else:
+            logger.warning(f"⚠️ 未找到 Prompt Key: {prompt_key}")
+            yield "（话术配置缺失，请联系管理员）"
         
         # 7. 更新 Redis 状态
         updated_state = state_tracker.to_dict()

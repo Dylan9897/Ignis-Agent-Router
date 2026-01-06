@@ -6,8 +6,6 @@
 import random
 from datetime import datetime, timedelta
 
-import random
-from datetime import datetime, timedelta
 
 def load_customer_from_db(session_id: str):
     """
