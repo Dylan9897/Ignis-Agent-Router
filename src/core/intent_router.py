@@ -1,7 +1,11 @@
 import logging
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import (
+    ChatPromptTemplate, 
+    FewShotChatMessagePromptTemplate,
+    SystemMessagePromptTemplate,
+    HumanMessagePromptTemplate
+)
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.runnables import RunnablePassthrough
 
 logger = logging.getLogger("BotLogger")
 
@@ -11,52 +15,88 @@ class IntentRouter:
         self.flow_config = flow_config
         self.settings = settings
         
-        # 定义 Prompt 模板（LangChain 风格）
-        # 这里使用了settings.yaml 中的模板结构
-        raw_template = settings.get('llm', {}).get('system_prompt_template', '')
-        
-        self.prompt = ChatPromptTemplate.from_template(raw_template)
-        
-        # 构建处理链：Prompt -> LLM -> String清洗
-        self.chain = self.prompt | self.llm | StrOutputParser()
+        # 1. 获取基础 System Prompt 模板 (来自 settings.yaml)
+        # 建议模板内容保持： "你是一个... 定义如下: {definitions}..."
+        self.system_tmpl_str = settings.get('llm', {}).get('system_prompt_template', '')
 
-    async def route(self, user_input: str, current_stage: str) -> str:
+    def _build_chain(self, current_stage):
         """
-        使用 LangChain Chain 进行意图识别 (改为异步调用)
+        动态构建当前阶段的 Chain (包含 Few-Shot)
         """
-        # 1. 从businees_flow准备上下文数据
         stage_config = self.flow_config.get(current_stage, {})
+        examples = stage_config.get('examples', [])
+        
+        # --- A. 构建 Few-Shot 模板 ---
+        if examples:
+            # 1. 定义单个示例的格式
+            example_prompt = ChatPromptTemplate.from_messages(
+                [
+                    ("human", "{input}"),
+                    ("ai", "{output}"),
+                ]
+            )
+            
+            # 2. 构建 Few-Shot 模板
+            few_shot_prompt = FewShotChatMessagePromptTemplate(
+                example_prompt=example_prompt,
+                examples=examples, # 这里直接传入 YAML 里读出来的 list
+            )
+        else:
+            few_shot_prompt = None
+
+        # --- B. 准备 System Prompt 变量 ---
         valid_intents = stage_config.get('valid_intents', [])
         intent_definitions = stage_config.get('intent_definitions', {})
-        
-        if not valid_intents:
-            return "其他"
-
         definitions_text = "\n".join([f"- {k}: {v}" for k, v in intent_definitions.items()])
 
-        # 2. 执行链 (invoke)
-        try:
-            # LangChain 会自动填充模板中的变量
-            intent = await self.chain.ainvoke({
-                "stage": current_stage,
-                "valid_intents": ", ".join(valid_intents),
-                "definitions": definitions_text,
-                "user_input": user_input
-            })
+        # --- C. 组装最终 Prompt ---
+        # 结构：System Message -> Few-Shot Examples -> Current User Input
+        messages = [
+            SystemMessagePromptTemplate.from_template(self.system_tmpl_str),
+        ]
+        
+        if few_shot_prompt:
+            messages.append(few_shot_prompt)
             
-            # 3. 结果清洗与校验 (LangChain 的 StrOutputParser 已经去除了外层引号)
+        messages.append(HumanMessagePromptTemplate.from_template("{user_input}"))
+        
+        final_prompt = ChatPromptTemplate.from_messages(messages)
+        
+        # --- D. 绑定变量 ---
+        # 这里虽然创建了 template，但此时是一个 partial 的状态，
+        # 我们可以在构建 chain 时把静态变量(definitions等)先填进去，减少 invoke 时的传参
+        final_prompt = final_prompt.partial(
+            stage=current_stage,
+            valid_intents=", ".join(valid_intents),
+            definitions=definitions_text
+        )
+
+        return final_prompt | self.llm | StrOutputParser()
+
+    async def route(self, user_input: str, current_stage: str) -> str:
+        # 动态构建针对当前 Stage 的 Chain
+        # (注：为了性能，可以将 build_chain 的结果缓存起来，不要每次 route 都重新 build)
+        chain = self._build_chain(current_stage)
+
+        try:
+            # 执行
+            intent = await chain.ainvoke({"user_input": user_input})
             intent = intent.strip()
             
-            if intent in valid_intents:
-                logger.info(f"✅ [LangChain] 意图识别: {intent}")
-                return intent
+            # ... 后续清洗校验逻辑保持不变 ...
+            stage_config = self.flow_config.get(current_stage, {})
+            valid_intents = stage_config.get('valid_intents', [])
             
-            # 模糊匹配兜底
+            if intent in valid_intents:
+                logger.info(f"✅ 意图识别: {intent}")
+                return intent
+                
+            # ... 模糊匹配逻辑 ...
             for valid in valid_intents:
                 if valid in intent:
                     return valid
             
-            return "其他"
+            return "其他"   
 
         except Exception as e:
             logger.error(f"❌ 意图识别失败: {e}")
