@@ -123,7 +123,7 @@ class DebtBotEngine:
         
         # 2. 使用 LLM 进行意图识别
         current_stage = state_tracker.current_node
-        intent = self.intent_router.route(user_input, current_stage)
+        intent = await self.intent_router.route(user_input, current_stage)
         logger.info(f"🎯 [Session {session_id}] 当前阶段: {current_stage}, 识别意图: {intent}")
         
         # 3. 更新状态：根据意图获取下一个状态
