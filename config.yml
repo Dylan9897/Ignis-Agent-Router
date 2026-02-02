@@ -1,0 +1,20 @@
+recipe: default.v1
+assistant_id: desktop_agent_2026
+language: zh
+
+pipeline:
+  # 1. 分词：中文必须保留 Jieba
+  - name: JiebaTokenizer
+
+  # 2. 特征提取：将文本转换为向量
+  - name: LanguageModelFeaturizer
+    model_name: "bert"
+    model_weights: "/home/root123/workspace/handx/Ignis-Agent-Router/ckpt/bert-base-chinese"
+
+  # 3. 核心识别：DIET 同时负责【意图分类】和【实体提取】
+  - name: DIETClassifier
+    epochs: 100
+    constrain_similarities: true
+
+# 策略部分：因为你不需要 Rasa 回复，这里可以全部删掉或者留空
+policies: []

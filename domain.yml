@@ -1,0 +1,36 @@
+version: "3.1"
+
+# 1、定义意图（CALM 模式下主要用于基础兜底，核心由 Flow 驱动）
+intents:
+  - send_wechat_message
+  - control_ppt
+  - search_file
+  - book_meeting
+  - chitchat
+
+# 2、定义槽位（对应 flows.yml 中的 collect）
+slots:
+  contact_name:
+    type: text
+    mappings:
+      - type: from_llm
+  message_content:
+    type: text
+    mappings:
+      - type: from_llm
+  ppt_command:
+    type: text
+    mappings:
+      - type: from_llm
+  file_keyword:
+    type: text
+    mappings:
+      - type: from_llm
+  meeting_topic:
+    type: text
+    mappings:
+      - type: from_llm
+  meeting_time:
+    type: text
+    mappings:
+      - type: from_llm
