@@ -3,6 +3,7 @@
 # @mail    : dylan_han@126.com    
 # @Time    : 2026/1/20 17:00
 # core/worker.py
+import os
 import threading
 import traceback
 import pyaudio
@@ -13,15 +14,22 @@ from PyQt6.QtCore import pyqtSignal, QThread
 
 from config import (
     DASHSCOPE_API_KEY, SAMPLE_RATE, CHANNELS, CHUNK_SIZE, 
-    MODEL_ASR, MODEL_LLM, MODEL_TTS, RASA_GATEWAY_URL, RASA_SENDER_ID
+    MODEL_ASR, MODEL_LLM, MODEL_TTS
 )
 from core.audio import AudioPlayer
 from core.callbacks import ConversationCallback
 from dashscope.audio.asr import Recognition
 from dashscope.audio.tts import SpeechSynthesizer
 
+# 导入技能模块
+from skills.action_generate_llm_response import GenerateLLMResponse
+from skills.server import get_intent
+
 # 设置 API KEY
 dashscope.api_key = DASHSCOPE_API_KEY
+
+# Rasa NLU 服务配置
+RASA_SESSION_ID = "frog_ai_session"
 
 
 class ConversationWorker(QThread):
@@ -38,6 +46,9 @@ class ConversationWorker(QThread):
         self.current_state = "IDLE"  # 跟踪当前状态
         # 初始化 AudioPlayer，传入打断事件以便实时检查
         self.player = AudioPlayer(interrupt_event=self.interrupt_event)
+        
+        # 初始化 LLM 服务（用于槽位提取和闲聊）
+        self.llm_service = GenerateLLMResponse()
 
     def stop(self):
         self.active = False
@@ -98,7 +109,6 @@ class ConversationWorker(QThread):
 
         while self.active:
             # === 1. 聆听阶段 ===
-            # 如果不是从打断跳转过来的，则需要监听用户输入
             is_interrupted = self.interrupt_event.is_set()
             
             if not is_interrupted:
@@ -169,7 +179,7 @@ class ConversationWorker(QThread):
             interrupt_thread.start()
 
             user_query = self.user_input_buffer
-            self.process_llm_tts(user_query)
+            self.process_with_intent_routing(user_query)
             
             # 等待播放完成或被打断
             self.player.wait_until_done()
@@ -177,89 +187,249 @@ class ConversationWorker(QThread):
             # 检查是否被打断
             if self.interrupt_event.is_set():
                 print("\n⚡ [System] 检测到打断，立即停止播报")
-                self.player.stop()  # 立即停止播放
+                self.player.stop()
             
-            # 状态回到空闲（让打断监听线程退出）
+            # 状态回到空闲
             self.current_state = "IDLE"
-            # 如果被打断，新的输入将在下一轮循环中处理
 
-    def process_llm_tts(self, text):
-        """混合模式：指令控制使用固定话术，闲聊使用大模型"""
+    def process_with_intent_routing(self, text):
+        """
+        核心流程：意图路由 + 分支处理
+        1. 调用 Rasa-Pro 识别意图
+        2. 根据意图类型分支处理
+        """
         try:
-            # === 步骤1: 调用 Rasa 获取意图 ===
-            print(f"[Rasa] 发送消息: {text}")
-            payload = {"sender_id": RASA_SENDER_ID, "text": text}
+            # === 步骤1: 调用 Rasa-Pro 获取意图 ===
+            print(f"\n🔍 [Rasa] 正在识别意图: {text}")
             
             try:
-                resp = requests.post(RASA_GATEWAY_URL, json=payload, timeout=30)  # 增加到30秒
-                resp.raise_for_status()
-                rasa_result = resp.json()
+                rasa_result = get_intent(RASA_SESSION_ID, text)
                 print(f"[Rasa] 返回结果: {rasa_result}")
-            except requests.RequestException as e:
-                print(f"⚠️ [Rasa] 连接失败，降级到纯大模型模式: {e}")
-                rasa_result = None
-            
-            # === 步骤2: 判断意图类型 ===
-            if rasa_result:
-                intent_name = rasa_result.get("intent", {}).get("name")
-                confidence = rasa_result.get("intent", {}).get("confidence", 0)
                 
-                # 指令控制类意图（前4种）
-                if intent_name in ["send_wechat_message", "search_file", "control_ppt"]:
-                    print(f"[指令模式] 识别到指令意图: {intent_name}")
-                    reply_text = self._generate_command_reply(intent_name, rasa_result)
-                    self._speak_text(reply_text)
-                    print(f"[指令模式] 固定话术播报完成")
-                    return
+                intent_name = rasa_result.get("intent", {}).get("name", "")
+                confidence = rasa_result.get("intent", {}).get("confidence", 0)
+                print(f"[Rasa] 意图: {intent_name}, 置信度: {confidence:.2f}")
+                
+            except Exception as e:
+                print(f"⚠️ [Rasa] 连接失败，降级到闲聊模式: {e}")
+                intent_name = "chitchat"
+                confidence = 0
             
-            # === 步骤3: 闲聊模式 - 调用大模型 ===
-            print(f"[闲聊模式] 调用大模型对话")
-            self._call_llm_streaming(text)
+            # === 步骤2: 根据意图分支处理 ===
+            
+            # 闲聊意图 - 直接调用大模型
+            if intent_name == "chitchat" or confidence < 0.5:
+                print(f"💬 [闲聊模式] 调用大模型对话")
+                self._handle_chitchat(text)
+                return
+            
+            # 发送微信消息意图
+            if intent_name == "send_wechat_message":
+                print(f"📱 [微信模式] 处理发送微信请求")
+                self._handle_send_wechat(text)
+                return
+            
+            # 控制PPT意图
+            if intent_name == "control_ppt":
+                print(f"📊 [PPT模式] 处理PPT控制请求")
+                self._handle_control_ppt(text)
+                return
+            
+            # 搜索文件意图
+            if intent_name == "search_file":
+                print(f"📁 [文件模式] 处理文件搜索请求")
+                self._handle_search_file(text)
+                return
+            
+            # 其他未识别意图，降级到闲聊
+            print(f"❓ [未知意图] {intent_name}，降级到闲聊模式")
+            self._handle_chitchat(text)
             
         except Exception as e:
-            print(f"\n❌ [Error] {e}")
-            import traceback
+            print(f"\n❌ [Error] 意图路由处理失败: {e}")
             traceback.print_exc()
-    
-    def _generate_command_reply(self, intent_name, rasa_result):
-        """根据指令意图生成固定话术回复（简洁版）"""
-        slots = rasa_result.get("slots", {})
-        action_status = slots.get("action_status", "success")
+            self._speak_text("抱歉，我遇到了一些问题，请稍后再试。")
+
+    def _handle_chitchat(self, text):
+        """处理闲聊意图 - 调用大模型流式回复"""
+        self._call_llm_streaming(text)
+
+    def _handle_send_wechat(self, text):
+        """
+        处理发送微信意图
+        1. 调用大模型提取槽位（联系人、消息内容）
+        2. 映射联系人姓名（处理ASR错别字）
+        3. 执行微信发送
+        4. 播报默认话术
+        """
+        # 1. 使用大模型提取槽位
+        contact_name, message_content = self.llm_service.extract_wechat_slots(text)
         
-        # 1. 发送微信消息
-        if intent_name == "send_wechat_message":
-            contact_name = slots.get("contact_name", "")
-            if contact_name:
-                return f"已通知给{contact_name}。"
+        if not contact_name or contact_name == "None":
+            self._speak_text("抱歉，我没听清要发给谁，请再说一遍。")
+            return
+        
+        if not message_content:
+            self._speak_text("抱歉，我没听清要发送什么内容，请再说一遍。")
+            return
+        
+        # 2. 执行微信发送
+        print(f"📱 [微信] 准备发送: 联系人={contact_name}, 消息={message_content}")
+        
+        try:
+            from skills.action_send_wechat import ActionSendWechat
+            
+            # 创建 Mock 对象来执行 Action
+            class MockTracker:
+                def __init__(self, slots):
+                    self.slots = slots
+                def get_slot(self, key):
+                    return self.slots.get(key)
+            
+            class MockDispatcher:
+                def utter_message(self, text=None, **kwargs):
+                    print(f"[微信Action] {text}")
+            
+            action = ActionSendWechat()
+            tracker = MockTracker({
+                "contact_name": contact_name,
+                "message_content": message_content
+            })
+            dispatcher = MockDispatcher()
+            
+            events = action.run(dispatcher, tracker, {})
+            
+            # 检查执行结果
+            action_status = "success"
+            for event in events:
+                if hasattr(event, 'key') and event.key == "action_status":
+                    action_status = event.value
+            
+            # 3. 播报默认话术
+            if action_status == "success":
+                reply_text = f"好的，已经通知{contact_name}了。"
             else:
-                return "已通知。"
+                reply_text = f"抱歉，发送给{contact_name}失败了，请检查微信是否已登录。"
+            
+        except Exception as e:
+            print(f"❌ [微信] 执行失败: {e}")
+            reply_text = "抱歉，发送微信时遇到了问题。"
         
-        # 2. 查找并打开文件
-        elif intent_name == "search_file":
-            file_keyword = slots.get("file_keyword", "")
-            if file_keyword:
-                return f"已打开{file_keyword}文件。"
-            else:
-                return "已打开文件。"
+        self._speak_text(reply_text)
+
+    def _handle_control_ppt(self, text):
+        """
+        处理控制PPT意图
+        1. 使用大模型提取关键词
+        2. 按相关性匹配PPT文件
+        3. 执行PPT操作
+        4. 播报默认话术
+        """
+        # 1. 使用大模型提取关键词
+        keyword = self.llm_service.extract_file_keyword(text, "PPT")
         
-        # 3. 控制PPT
-        elif intent_name == "control_ppt":
-            ppt_command = slots.get("ppt_command", "")
-            # 如果是开始播放，提取文件关键词
-            if "开始" in ppt_command or "播放" in ppt_command or "打开" in ppt_command:
-                file_keyword = slots.get("file_keyword", "")
-                if file_keyword:
-                    return f"已打开{file_keyword}文件。"
+        if not keyword:
+            self._speak_text("抱歉，我没听清要打开哪个PPT，请再说一遍。")
+            return
+        
+        # 2. 按相关性搜索PPT文件
+        file_path, file_name = self.llm_service.search_ppt_by_relevance(keyword)
+        
+        if not file_path:
+            self._speak_text(f"抱歉，没有找到包含\"{keyword}\"的PPT文件。")
+            return
+        
+        # 3. 判断是打开还是控制操作
+        play_keywords = ["播放", "全屏", "放映", "开始", "启动"]
+        nav_keywords = ["下一页", "上一页", "后", "前", "退出", "结束"]
+        
+        is_play = any(word in text for word in play_keywords)
+        is_nav = any(word in text for word in nav_keywords)
+        
+        try:
+            import pyautogui
+            import pygetwindow as gw
+            import time
+            
+            if not is_nav:
+                # 打开或播放PPT
+                # 检查是否已经打开
+                existing_wins = [w for w in gw.getAllWindows() 
+                               if keyword.lower() in w.title.lower() or "WPS 演示" in w.title]
+                
+                if not existing_wins:
+                    os.startfile(file_path)
+                    time.sleep(3.0)
+                
+                # 激活窗口
+                active_wins = [w for w in gw.getAllWindows() 
+                              if keyword.lower() in w.title.lower() or "WPS 演示" in w.title]
+                if active_wins:
+                    win = active_wins[0]
+                    if win.isMinimized:
+                        win.restore()
+                    win.activate()
+                    time.sleep(0.5)
+                
+                if is_play:
+                    pyautogui.press('f5')
+                    reply_text = f"已为您打开并播放{file_name}。"
                 else:
-                    return "已打开PPT文件。"
-            # 其他操作（翻页、结束等）统一回复"好的"
+                    reply_text = f"已为您打开{file_name}。"
             else:
-                return "好的。"
+                # 翻页或退出操作
+                if "下" in text or "后" in text:
+                    pyautogui.press('right')
+                    reply_text = "好的，下一页。"
+                elif "上" in text or "前" in text:
+                    pyautogui.press('left')
+                    reply_text = "好的，上一页。"
+                elif "退出" in text or "结束" in text:
+                    pyautogui.press('esc')
+                    reply_text = "好的，已退出播放。"
+                else:
+                    reply_text = "好的。"
+            
+        except Exception as e:
+            print(f"❌ [PPT] 执行失败: {e}")
+            reply_text = "抱歉，控制PPT时遇到了问题。"
         
-        return "好的。"
-    
+        self._speak_text(reply_text)
+
+    def _handle_search_file(self, text):
+        """
+        处理搜索文件意图
+        1. 使用大模型提取关键词
+        2. 按相关性匹配文件
+        3. 打开文件
+        4. 播报默认话术
+        """
+        # 1. 使用大模型提取关键词
+        keyword = self.llm_service.extract_file_keyword(text, "文件")
+        
+        if not keyword:
+            self._speak_text("抱歉，我没听清要查找什么文件，请再说一遍。")
+            return
+        
+        # 2. 按相关性搜索文件
+        file_path, file_name = self.llm_service.search_file_by_relevance(keyword)
+        
+        if not file_path:
+            self._speak_text(f"抱歉，没有找到包含\"{keyword}\"的文件。")
+            return
+        
+        # 3. 打开文件
+        try:
+            os.startfile(file_path)
+            reply_text = f"已为您打开{file_name}。"
+        except Exception as e:
+            print(f"❌ [文件] 打开失败: {e}")
+            reply_text = f"抱歉，打开{file_name}时遇到了问题。"
+        
+        self._speak_text(reply_text)
+
     def _call_llm_streaming(self, text):
-        """流式调用通义千问大模型"""
+        """流式调用通义千问大模型（闲聊模式）"""
         responses = dashscope.Generation.call(
             model=MODEL_LLM,
             prompt=text,
@@ -284,10 +454,9 @@ class ConversationWorker(QThread):
                 full_text = content
                 if not delta: continue
 
-                print(delta, end="", flush=True)  # 打印 AI 回复
+                print(delta, end="", flush=True)
 
                 buffer_text += delta
-                # 遇到标点符号，切分送去 TTS
                 for char in delta:
                     if char in punctuations:
                         if not self.interrupt_event.is_set():
@@ -298,7 +467,7 @@ class ConversationWorker(QThread):
         # 处理剩余的文本
         if buffer_text and self.active and not self.interrupt_event.is_set():
             self.synthesize_and_play(buffer_text)
-        print()  # 换行
+        print()
     
     def _speak_text(self, text):
         """将文本按标点符号分段，送去 TTS 播放"""
@@ -310,21 +479,17 @@ class ConversationWorker(QThread):
             buffer_text += char
             if char in punctuations:
                 if buffer_text.strip() and not self.interrupt_event.is_set():
-                    print(f"[TTS] 准备播放分段: {buffer_text.strip()}")
                     self.synthesize_and_play(buffer_text)
                 buffer_text = ""
         
         # 处理剩余的文本
         if buffer_text.strip() and self.active and not self.interrupt_event.is_set():
-            print(f"[TTS] 准备播放剩余文本: {buffer_text.strip()}")
             self.synthesize_and_play(buffer_text)
 
     def synthesize_and_play(self, text):
         if not text.strip(): 
-            print("[TTS] 文本为空，跳过")
             return
         try:
-            print(f"[TTS] 正在合成语音: {text.strip()[:20]}...")
             result = SpeechSynthesizer.call(
                 model=MODEL_TTS,
                 text=text,
@@ -332,12 +497,7 @@ class ConversationWorker(QThread):
             )
             if result.get_audio_data():
                 audio_data = result.get_audio_data()
-                print(f"[TTS] 合成成功，音频大小: {len(audio_data)} 字节")
                 self.player.play(audio_data)
-                print(f"[TTS] 已加入播放队列")
-            else:
-                print(f"⚠️ [TTS] 未获取到音频数据")
         except Exception as e:
             print(f"❌ [TTS Error] {e}")
-            import traceback
             traceback.print_exc()
